@@ -1,0 +1,15 @@
+[project]
+name = "ComfyUI_Monetization"
+description = "ComfyMon, a tool that converts ComfyUI workflows into WeChat Mini Program, Douyin Mini Program, and H5 with one click, and supports payments."
+version = "1.0.0"
+license = { file = "LICENSE" }
+
+[project.urls]
+Repository = "https://github.com/zhulu111/ComfyUI_Monetization"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI_Monetization"
+Icon = ""
+

@@ -1,11 +1,14 @@
 import asyncio
 import json
+import re
+import subprocess
+import time
 
 import aiohttp
 import server
 from aiohttp import web
 
-from .install import *
+from collections import deque
 
 import os
 import uuid
@@ -13,54 +16,22 @@ import hashlib
 import platform
 import stat
 import urllib.request
-
-
-from pathlib import Path
-
-def download_file(url, target_directory):
-    # 创建Path对象
-    target_dir = Path(target_directory)
-
-    # 确保目标目录存在
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    # 获取文件名
-    filename = url.split('/')[-1]
-
-    # 构建完整的文件路径
-    local_filepath = target_dir / filename
-
-    # 下载文件
-    urllib.request.urlretrieve(url, str(local_filepath))
-
-file_path = "./custom_nodes/ComfyUI_Monetization/wss.py"
-# 检查文件是否存在
-if os.path.exists(file_path) is False:
-    # 使用函数下载文件到指定目录
-    url = "https://tt-1254127940.file.myqcloud.com/tech_huise/66/qita/wss.py"
-    target_directory = "./custom_nodes/ComfyUI_Monetization"
-    download_file(url, target_directory)
-    print('下载文件成功')
-    print('下载文件成功')
-    print('下载文件成功')
-    print('下载文件成功')
-    print('下载文件成功')
-    print('下载文件成功')
-    print('下载文件成功')
-    print('下载文件成功')
-    print('下载文件成功')
-    print('下载文件成功')
-    print('下载文件成功')
+import numpy as np
 
 from .wss import thread_run, update_worker_flow
 from .public import get_port_from_cmdline, set_token, get_token, get_version, \
-    set_openid, get_openid
+    set_openid, get_openid, find_project_root, args
 # 测试 start
 
 # 使用当前项目所使用python的pip安装
 # .\python -m pip install websockets
 
 import threading
+
+import folder_paths
+from PIL import Image
+
+input_directory = args.input_directory if args.input_directory else find_project_root() + 'input'
 
 
 # 测试 end
@@ -101,12 +72,168 @@ def download_file(url, dest_path):
 # 获取插件的绝对路径
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 获取插件的绝对路径
+
+# 设置 sd_client 目录下的文件路径
+SD_CLIENT_DIR = os.path.join(PLUGIN_DIR, "sdc")
+SDC_EXECUTABLE = os.path.join(SD_CLIENT_DIR, "sdc" if platform.system() != "Windows" else "sdc.exe")
+INI_FILE = os.path.join(SD_CLIENT_DIR, "sdc.toml")
+LOG_FILE = os.path.join(SD_CLIENT_DIR, "sdc.log")
+
+
+class SDClient:
+    RED = "\033[91m"
+    RESET = "\033[0m"
+
+    def __init__(self, local_port, subdomain):
+        self.local_port = local_port
+        self.server_addr = "suidao.9syun.com"
+        self.server_port = "7000"
+        self.token = "my_secure_token"
+        self.subdomain = subdomain
+        self.sd_process = None
+        self.connected = False
+        self.monitoring_thread = None
+        self.stop_monitoring = False
+
+    def create_sdc_ini(self, file_path, subdomain):
+        # 生成 sdc.toml 文件
+        config_content = f"""
+[common]
+server_addr = "{self.server_addr}"
+server_port = {self.server_port}
+token = "{self.token}"
+login_fail_exit = false
+
+[{subdomain}]
+type = "http"
+local_port = {self.local_port}
+subdomain = "{subdomain}"
+remote_port = 0
+log_file = "{LOG_FILE}"
+log_level = "info"
+"""
+        with open(file_path, "w") as config_file:
+            config_file.write(config_content)
+
+    def tail_log(self, filename, num_lines=20):
+        # 获取日志文件的最后几行
+        try:
+            with open(filename, "r") as file:
+                return deque(file, num_lines)
+        except FileNotFoundError:
+            return deque()
+
+    def check_sd_log_for_status(self):
+        # 检查日志文件中是否包含连接成功或失败的标志性信息
+        success_keywords = ["login to server success", "start proxy success"]
+        failure_keywords = ["connect to server error", "read tcp", "session shutdown"]
+        connection_attempt_pattern = re.compile(r"try to connect to server")
+
+        latest_lines = self.tail_log(LOG_FILE, 20)
+
+        connection_attempt_index = None
+
+        # 找到最后一次尝试连接的索引
+        for index, line in enumerate(latest_lines):
+            if connection_attempt_pattern.search(line):
+                connection_attempt_index = index
+
+        if connection_attempt_index is not None and connection_attempt_index + 1 < len(latest_lines):
+            next_line = latest_lines[connection_attempt_index + 1]
+
+            for keyword in success_keywords:
+                if keyword in next_line:
+                    return "connected"
+            return "disconnected"
+
+        return "disconnected"
+
+    def check_and_download_executable(self):
+        if platform.system() != "Windows":
+            if not os.path.exists(SDC_EXECUTABLE):
+                print("SDC executable not found, downloading...")
+                download_file("https://tt-1254127940.file.myqcloud.com/tech_huise/66/qita/sdc", SDC_EXECUTABLE)
+                set_executable_permission(SDC_EXECUTABLE)
+
+    def start(self):
+        # 启动 SD 客户端
+        # self.check_and_download_executable()  # 检查并下载可执行文件
+        self.create_sdc_ini(INI_FILE, self.subdomain)
+
+        # 清空或创建日志文件
+        open(LOG_FILE, "w").close()
+
+        # 创建一个环境变量字典，清除代理设置
+        env1 = os.environ.copy()
+        env1['http_proxy'] = ''
+        env1['https_proxy'] = ''
+        env1['no_proxy'] = '*'  # 添加无代理配置
+
+        try:
+            # 启动 sdc 并重定向输出到日志文件
+            with open(LOG_FILE, "a") as log_file:
+                self.sd_process = subprocess.Popen([SDC_EXECUTABLE, "-c", INI_FILE], stdout=log_file, stderr=log_file,
+                                                   env=env1)
+            print(f"SD client started with PID: {self.sd_process.pid}")
+
+            # 启动监控线程
+            self.stop_monitoring = False
+            self.monitoring_thread = threading.Thread(target=self.monitor_connection_status, daemon=True)
+            self.monitoring_thread.start()
+
+        except FileNotFoundError:
+            print(f"Error: '{SDC_EXECUTABLE}' not found。")
+        except Exception as e:
+            print(f"Error starting SD client: {e}")
+
+    def monitor_connection_status(self):
+        # 监测 SD 连接状态
+        while not self.stop_monitoring:
+            status = self.check_sd_log_for_status()
+            if status == "connected":
+                if not self.connected:
+                    print(f"SD client successfully connected with PID: {self.sd_process.pid}")
+                    self.connected = True
+            else:
+                if self.connected:
+                    print(f"{self.RED}Waiting for SD client to connect...{self.RESET}")
+                    self.connected = False
+            time.sleep(1)
+
+    def stop(self):
+        # 停止 SD 客户端并终止监控线程
+        if self.sd_process and self.sd_process.poll() is None:
+            self.sd_process.terminate()
+            self.sd_process.wait()
+            print("SD client stopped。")
+        else:
+            print("SD client is not running。")
+        self.connected = False
+        self.stop_monitoring = True
+
+    def is_connected(self):
+        # 检查 SD 客户端是否连接成功
+        return self.connected
+
+    def clear_log(self):
+        # 清理日志文件
+        if os.path.exists(LOG_FILE):
+            open(LOG_FILE, "w").close()
+            print("SD client log cleared。")
+
+
 subdomain = ""
 websocket = None
 if platform.system() != "Darwin":
     local_port = get_port_from_cmdline()
     subdomain = generate_unique_subdomain(get_mac_address(), local_port)
-    thread_run()
+    SDC_EXECUTABLE = os.path.join(SD_CLIENT_DIR, "sdc" if platform.system() != "Windows" else "sdc.exe")
+    if os.path.exists(SDC_EXECUTABLE):
+        sd_client = SDClient(local_port=local_port, subdomain=subdomain)
+        sd_client.start()
+
+thread_run()
 
 
 def extract_and_verify_images(output):
@@ -126,7 +253,7 @@ def extract_and_verify_images(output):
             image_node = output[str(img_key)]
             image_path = image_node.get("inputs", {}).get("image")
             if image_path:
-                if verify_image_exists('./input/'+image_path):
+                if verify_image_exists(input_directory + '/' + image_path):
                     results[app_img_key] = {"image_path": image_path, "status": "图片存在"}
                 else:
                     err = err + 1
@@ -154,6 +281,7 @@ def verify_image_exists(path):
             return True
     return False
 
+
 @server.PromptServer.instance.routes.post("/manager/tech_zhulu")
 async def tech_zhulu(request):
     json_data = await request.json()
@@ -169,11 +297,11 @@ async def tech_zhulu(request):
 
         if json_data['r'] == 'comfyui.apiv2.upload':
             output = json_data['postData']['output']
+            workflow = json_data['postData']['workflow']
             # 删除字典中 的 output
 
             try:
                 output_verify = extract_and_verify_images(output)
-                print(output_verify)
                 if output_verify['err'] > 0:
                     err_info = {
                         "errno": 0,
@@ -188,11 +316,12 @@ async def tech_zhulu(request):
                     return web.Response(status=200, text=json.dumps(err_info))
 
                 json_data['postData'].pop('output')
+                json_data['postData'].pop('workflow')
                 form_data = aiohttp.FormData()
                 form_data.add_field('json_data', json.dumps(json_data))
                 if 'zhutus' in json_data['postData']:
                     for item in json_data['postData']['zhutus']:
-                        with open('./input/' + item, 'rb') as f:
+                        with open(input_directory + '/' + item, 'rb') as f:
                             file_content = f.read()
                         # 文件写入到变量
                         form_data.add_field('zhutus[]', file_content, filename=os.path.basename(item),
@@ -204,24 +333,15 @@ async def tech_zhulu(request):
 
                 try:
                     response_result = await response.text()
-                    print('=================================================')
-
-                    print(response_result)
-                    print(response_result)
-                    print(response_result)
-                    print(response_result)
-                    print(response_result)
-                    print('=================================================')
                     result = json.loads(response_result)
 
                     if 'data' in result and isinstance(result['data'], dict):
-                        print(result['data'])
                         if 'data' in result['data'] and isinstance(result['data']['data'], dict):
                             result_data = result['data']['data']
                             # 工作流写入
                             if techsid != '' and techsid != 'init' and result_data['code'] == 1:
-                                openid = get_openid()
-                                await update_worker_flow(json_data['postData']['uniqueid'], output, openid)
+                                await update_worker_flow(result_data['name'], output)
+                                await update_worker_flow(result_data['name'], workflow, 'workflow/')
 
                         return web.Response(status=response.status, text=response_result)
                     else:
@@ -255,7 +375,6 @@ async def tech_zhulu(request):
                             'data']:
                             if len(result_data['data']['data']['techsid']) > len('12345'):
                                 set_token(result_data['data']['data']['techsid'])
-                                set_openid(result_data['data']['data']['openid'])
                             pass
                         return web.json_response(result)
                     except json.JSONDecodeError as e:
@@ -401,14 +520,66 @@ class ComfyMon_textInput:
         return (text,)
 
 
+class ComfyMon_saveImage:
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+        self.type = "output"
+        self.prefix_append = ""
+        self.compress_level = 4
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required":
+                    {"images": ("IMAGE",),
+                     "filename_prefix": ("STRING", {"default": "ComfyUI"})},
+                }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save_images"
+
+    OUTPUT_NODE = True
+
+    CATEGORY = "ComfyMon"
+
+    def save_images(self, images, filename_prefix="ComfyMon"):
+        filename_prefix += self.prefix_append
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+            filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
+        results = list()
+        for (batch_number, image) in enumerate(images):
+            i = 255. * image.cpu().numpy()
+            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+            metadata = None
+            filename_with_batch_num = filename.replace("%batch_num%", str(batch_number))
+            file = f"ComfyMon_{filename_with_batch_num}_{counter:05}_.png"
+            img.save(os.path.join(full_output_folder, file), pnginfo=metadata, compress_level=self.compress_level)
+            results.append({
+                "filename": file,
+                "subfolder": subfolder,
+                "type": self.type
+            })
+            counter += 1
+
+        return {"ui": {"images": results}}
+
+
+workspace_path = os.path.join(os.path.dirname(__file__))
+dist_path = os.path.join(workspace_path, 'huise_admin')
+if os.path.exists(dist_path):
+    server.PromptServer.instance.app.add_routes([
+        web.static('/huise_admin/', dist_path),
+    ])
+
 WEB_DIRECTORY = "./web"
 
 NODE_CLASS_MAPPINGS = {
     "ComfyMon": ComfyMon,
     "ComfyMon_textInput": ComfyMon_textInput,
+    "ComfyMon_saveImage": ComfyMon_saveImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ComfyMon": "ComfyMon",
-    "ComfyMon_textInput": "textInput"
+    "ComfyMon_textInput": "textInput",
+    "ComfyMon_saveImage": "saveImage",
 }
